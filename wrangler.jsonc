@@ -1,0 +1,30 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "telegram-gallery",
+	"compatibility_date": "2026-02-25",
+	"main": "server/index.js",
+	"assets": {
+		"not_found_handling": "single-page-application"
+	},
+	"observability": {
+		"enabled": true
+	},
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	/**
+	 * Smart Placement - routes requests closer to MongoDB/Telegram APIs
+	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+	 */
+	"placement": { "mode": "smart" }
+	/**
+	 * Environment Variables (secrets)
+	 * Set via: wrangler secret put <KEY>
+	 * Required secrets: MONGO_URI, GALLERY_USER, GALLERY_PASS, JWT_SECRET, BOT_TOKEN
+	 * Optional secrets: TURNSTILE_SECRET_KEY
+	 */
+}

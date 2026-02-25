@@ -1,0 +1,400 @@
+import { MongoClient, ObjectId } from 'mongodb';
+
+// ========== JWT helpers (Web Crypto API, CF Workers compatible) ==========
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+function base64UrlEncode(data) {
+  let str;
+  if (typeof data === 'string') {
+    str = btoa(data);
+  } else {
+    // Uint8Array
+    str = btoa(String.fromCharCode(...data));
+  }
+  return str.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  const binary = atob(str);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function getSigningKey(secret) {
+  return crypto.subtle.importKey(
+    'raw',
+    textEncoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  );
+}
+
+async function jwtSign(payload, secret, expiresInSeconds = 365 * 24 * 3600) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const fullPayload = { ...payload, iat: now, exp: now + expiresInSeconds };
+
+  const headerB64 = base64UrlEncode(JSON.stringify(header));
+  const payloadB64 = base64UrlEncode(JSON.stringify(fullPayload));
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  const key = await getSigningKey(secret);
+  const signature = await crypto.subtle.sign('HMAC', key, textEncoder.encode(signingInput));
+
+  return `${signingInput}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+async function jwtVerify(token, secret) {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid token');
+
+  const [headerB64, payloadB64, signatureB64] = parts;
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  const key = await getSigningKey(secret);
+  const signature = base64UrlDecode(signatureB64);
+  const valid = await crypto.subtle.verify('HMAC', key, signature, textEncoder.encode(signingInput));
+
+  if (!valid) throw new Error('Invalid signature');
+
+  const payload = JSON.parse(textDecoder.decode(base64UrlDecode(payloadB64)));
+  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+    throw new Error('Token expired');
+  }
+
+  return payload;
+}
+
+// ========== Turnstile verification ==========
+
+async function verifyTurnstileToken(token, ip, secretKey) {
+  if (!secretKey) return true; // skip in dev
+
+  const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      secret: secretKey,
+      response: token,
+      remoteip: ip,
+    }),
+  });
+  const data = await response.json();
+  return data.success;
+}
+
+// ========== Telegram file URL helpers ==========
+
+const TELEGRAM_OFFICIAL = 'https://api.telegram.org';
+const TELEGRAM_PROXY = 'https://tgapi.kairod.cfd';
+
+function buildUrlFromFilePath(botToken, filePath, useProxy = false) {
+  if (!filePath) return null;
+  if (useProxy) return `${TELEGRAM_PROXY}/file/bot${botToken}/${filePath}`;
+  return `${TELEGRAM_OFFICIAL}/file/bot${botToken}/${filePath}`;
+}
+
+// ========== MongoDB helper ==========
+
+async function withMongo(mongoUri, fn) {
+  const client = new MongoClient(mongoUri);
+  try {
+    await client.connect();
+    const db = client.db('magic_plugin_db');
+    return await fn(db);
+  } finally {
+    await client.close();
+  }
+}
+
+// ========== CORS headers ==========
+
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+  };
+}
+
+function jsonResponse(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...corsHeaders(),
+      ...extraHeaders,
+    },
+  });
+}
+
+// ========== Route: /api/login ==========
+
+async function handleLogin(request, env) {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method Not Allowed' }, 405);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const { username, password, turnstileToken } = body;
+
+  const USER = env.GALLERY_USER || 'admin';
+  const PASS = env.GALLERY_PASS || 'password';
+  const SECRET = env.JWT_SECRET || 'change-me';
+
+  // Verify Turnstile
+  if (turnstileToken) {
+    const clientIp = request.headers.get('cf-connecting-ip') ||
+                     request.headers.get('x-forwarded-for')?.split(',')[0] || '';
+    const isValid = await verifyTurnstileToken(turnstileToken, clientIp, env.TURNSTILE_SECRET_KEY);
+    if (!isValid) {
+      return jsonResponse({ error: '人机验证失败，请重试' }, 403);
+    }
+  }
+
+  if (!username || !password || username !== USER || password !== PASS) {
+    return jsonResponse({ error: '用户名或密码错误' }, 401);
+  }
+
+  const token = await jwtSign({ user: username }, SECRET);
+  return jsonResponse({ token });
+}
+
+// ========== Route: /api/gallery ==========
+
+async function handleGallery(request, env) {
+  if (request.method !== 'GET' && request.method !== 'DELETE') {
+    return jsonResponse({ error: 'Method Not Allowed' }, 405);
+  }
+
+  // Auth
+  const auth = (request.headers.get('authorization') || '').split(' ')[1];
+  const SECRET = env.JWT_SECRET || 'change-me';
+  try {
+    if (!auth) throw new Error('No token');
+    await jwtVerify(auth, SECRET);
+  } catch (e) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  const MONGO_URI = env.MONGO_URI;
+  if (!MONGO_URI) {
+    return jsonResponse({ error: 'MONGO_URI not configured' }, 500);
+  }
+
+  return withMongo(MONGO_URI, async (db) => {
+    const collection = db.collection('gallery');
+
+    if (request.method === 'DELETE') {
+      const body = await request.json().catch(() => ({}));
+      const id = body?.id;
+      if (!id) {
+        return jsonResponse({ error: 'Missing id' }, 400);
+      }
+      try {
+        const result = await collection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 1) {
+          return jsonResponse({ ok: true, deletedId: id });
+        } else {
+          return jsonResponse({ error: 'Not found' }, 404);
+        }
+      } catch (e) {
+        return jsonResponse({ error: String(e) }, 500);
+      }
+    }
+
+    // GET: gallery list
+    const url = new URL(request.url);
+    const limitRaw = url.searchParams.get('limit');
+    const cursorRaw = url.searchParams.get('cursor');
+    const cursor = typeof cursorRaw === 'string' ? cursorRaw.trim() : '';
+    const wantsPagination = limitRaw !== null || Boolean(cursor);
+
+    const toGalleryItem = (d) => ({
+      id: d._id.toString(),
+      prompt: d.prompt,
+      metadata: d.metadata || {},
+      telegram: {
+        chat_id: d.telegram?.chat_id || null,
+        file_id: d.telegram?.file_id || null,
+      },
+      timestamp: d.timestamp,
+    });
+
+    if (wantsPagination) {
+      const parsedLimit = parseInt(String(limitRaw ?? ''), 10);
+      const limit = Number.isFinite(parsedLimit)
+        ? Math.max(1, Math.min(parsedLimit, 200))
+        : 60;
+
+      let query = {};
+      if (cursor) {
+        if (!ObjectId.isValid(cursor)) {
+          return jsonResponse({ error: 'Invalid cursor' }, 400);
+        }
+        query = { _id: { $lt: new ObjectId(cursor) } };
+      }
+
+      const docs = await collection
+        .find(query, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+        .sort({ _id: -1 })
+        .limit(limit + 1)
+        .toArray();
+
+      const hasMore = docs.length > limit;
+      const pageDocs = hasMore ? docs.slice(0, limit) : docs;
+      const items = pageDocs.map(toGalleryItem);
+      const nextCursor = hasMore && pageDocs.length > 0
+        ? pageDocs[pageDocs.length - 1]._id.toString()
+        : null;
+
+      return jsonResponse(
+        { items, hasMore, nextCursor, limit },
+        200,
+        { 'Cache-Control': 'public, max-age=60' }
+      );
+    }
+
+    // Legacy: return up to 200 items
+    const docs = await collection
+      .find({}, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+      .sort({ timestamp: -1 })
+      .limit(200)
+      .toArray();
+
+    return jsonResponse(
+      docs.map(toGalleryItem),
+      200,
+      { 'Cache-Control': 'public, max-age=60' }
+    );
+  });
+}
+
+// ========== Route: /api/fileurl ==========
+
+async function handleFileUrl(request, env) {
+  const url = new URL(request.url);
+  const file_id = url.searchParams.get('file_id');
+  if (!file_id) {
+    return jsonResponse({ error: 'file_id required' }, 400);
+  }
+
+  const MONGO_URI = env.MONGO_URI;
+  let botToken = env.BOT_TOKEN || null;
+
+  if (MONGO_URI) {
+    try {
+      const client = new MongoClient(MONGO_URI);
+      try {
+        await client.connect();
+        const db = client.db('magic_plugin_db');
+        const collection = db.collection('gallery');
+        const doc = await collection.findOne({ 'telegram.file_id': file_id });
+        if (doc && doc.telegram && doc.telegram.bot_token) {
+          botToken = doc.telegram.bot_token;
+        }
+      } finally {
+        await client.close();
+      }
+    } catch (e) {
+      // fallback to env
+    }
+  }
+
+  if (!botToken) {
+    return jsonResponse({ error: 'No bot token available' }, 500);
+  }
+
+  // Try official getFile
+  try {
+    const resp = await fetch(`${TELEGRAM_OFFICIAL}/bot${botToken}/getFile?file_id=${encodeURIComponent(file_id)}`);
+    const data = await resp.json();
+    if (data && data.ok && data.result && data.result.file_path) {
+      const filePath = data.result.file_path;
+      const urlDirect = buildUrlFromFilePath(botToken, filePath, false);
+
+      const imageResp = await fetch(urlDirect);
+      if (imageResp.ok) {
+        const contentType = imageResp.headers.get('content-type') || 'image/jpeg';
+        return new Response(imageResp.body, {
+          status: 200,
+          headers: {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable',
+            ...corsHeaders(),
+          },
+        });
+      }
+    }
+  } catch (e) {
+    // fallthrough to proxy
+  }
+
+  // Try proxy
+  try {
+    const resp2 = await fetch(`${TELEGRAM_PROXY}/bot${botToken}/getFile?file_id=${encodeURIComponent(file_id)}`);
+    const data2 = await resp2.json();
+    if (data2 && data2.ok && data2.result && data2.result.file_path) {
+      const filePath = data2.result.file_path;
+      const urlDirect = buildUrlFromFilePath(botToken, filePath, true);
+
+      const imageResp = await fetch(urlDirect);
+      if (imageResp.ok) {
+        const contentType = imageResp.headers.get('content-type') || 'image/jpeg';
+        return new Response(imageResp.body, {
+          status: 200,
+          headers: {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable',
+            ...corsHeaders(),
+          },
+        });
+      }
+    }
+  } catch (e) {
+    // final fallback
+  }
+
+  return jsonResponse({ error: 'Failed to retrieve file URL' }, 502);
+}
+
+// ========== Main Worker ==========
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 200,
+        headers: corsHeaders(),
+      });
+    }
+
+    // API routing
+    if (url.pathname === '/api/login') {
+      return handleLogin(request, env);
+    }
+    if (url.pathname === '/api/gallery') {
+      return handleGallery(request, env);
+    }
+    if (url.pathname === '/api/fileurl') {
+      return handleFileUrl(request, env);
+    }
+    if (url.pathname.startsWith('/api/')) {
+      return jsonResponse({ error: 'Not Found' }, 404);
+    }
+
+    // Non-API routes are handled by the assets (SPA)
+    return new Response(null, { status: 404 });
+  },
+};
