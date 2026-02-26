@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed, inject, nextTick } from "vue";
+import { ref, onMounted, onUnmounted, computed, inject, nextTick, watch } from "vue";
 import ImageDetail from "./ImageDetail.vue";
 
 const token = localStorage.getItem("gallery_token");
@@ -15,6 +15,12 @@ const hasMore = ref(true);
 const paginationCursor = ref(null);
 const PAGE_SIZE = 60;
 const pendingImageLoads = new Set();
+const IMAGE_CACHE_MAX_ITEMS = 300;
+const ROOT_BACK_EXIT_WINDOW_MS = 1500;
+const DETAIL_AUTO_LOAD_THRESHOLD = 5;
+let lastRootBackAt = 0;
+let hasDetailHistoryState = false;
+let suppressNextPopstate = false;
 
 // 从 App 提供的 theme 注入
 const theme = inject('theme', ref('light'));
@@ -154,23 +160,82 @@ async function performBatchDelete() {
 const IMAGE_CACHE_KEY = 'gallery_image_cache';
 const GALLERY_LIST_CACHE_KEY = 'gallery_list_cache';
 
+function normalizeImageCache(cache) {
+  if (!cache || typeof cache !== 'object' || Array.isArray(cache)) {
+    return {};
+  }
+
+  const normalized = {};
+  Object.entries(cache).forEach(([fileId, item]) => {
+    if (!fileId || !item || typeof item.url !== 'string' || !item.url) return;
+    normalized[fileId] = {
+      url: item.url,
+      updatedAt: Number.isFinite(item.updatedAt) ? item.updatedAt : 0,
+    };
+  });
+  return normalized;
+}
+
+function pruneImageCache(cache, maxItems = IMAGE_CACHE_MAX_ITEMS) {
+  const keys = Object.keys(cache);
+  if (keys.length <= maxItems) return cache;
+
+  const keepKeys = keys
+    .sort((a, b) => (cache[b]?.updatedAt || 0) - (cache[a]?.updatedAt || 0))
+    .slice(0, maxItems);
+
+  const trimmed = {};
+  keepKeys.forEach((key) => {
+    trimmed[key] = cache[key];
+  });
+  return trimmed;
+}
+
+function persistImageCache(cache) {
+  const normalized = pruneImageCache(normalizeImageCache(cache));
+  try {
+    localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(normalized));
+    return normalized;
+  } catch (e) {
+    // If quota is exceeded, keep only half of the newest entries and retry once.
+    const fallback = pruneImageCache(normalized, Math.max(50, Math.floor(IMAGE_CACHE_MAX_ITEMS / 2)));
+    try {
+      localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(fallback));
+      return fallback;
+    } catch (err) {
+      console.error('Failed to persist image cache:', err);
+      return {};
+    }
+  }
+}
+
 function getImageCache() {
   try {
     const cache = localStorage.getItem(IMAGE_CACHE_KEY);
-    return cache ? JSON.parse(cache) : {};
+    return normalizeImageCache(cache ? JSON.parse(cache) : {});
   } catch (e) {
     return {};
   }
 }
 
 function setImageCache(fileId, url) {
+  if (!fileId || !url) return;
   try {
     const cache = getImageCache();
-    cache[fileId] = { url };
-    localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(cache));
+    cache[fileId] = { url, updatedAt: Date.now() };
+    persistImageCache(cache);
   } catch (e) {
     console.error('Failed to cache image:', e);
   }
+}
+
+function buildFileUrl(fileId, withCacheBust = false) {
+  const params = new URLSearchParams();
+  params.set('file_id', fileId);
+  if (withCacheBust) {
+    params.set('t', String(Date.now()));
+  }
+  return `/api/fileurl?${params.toString()}`;
 }
 
 function getGalleryListCache() {
@@ -202,7 +267,7 @@ function removeEntryFromLocalCache(entry) {
     const imageCache = getImageCache();
     if (imageCache[fileId]) {
       delete imageCache[fileId];
-      localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(imageCache));
+      persistImageCache(imageCache);
     }
   } catch (e) {
     // ignore cache cleanup errors
@@ -340,7 +405,7 @@ async function loadEntryImage(entry) {
 
   pendingImageLoads.add(fileId);
   try {
-    const imageUrl = `/api/fileurl?file_id=${encodeURIComponent(fileId)}`;
+    const imageUrl = buildFileUrl(fileId, false);
     entry.src = imageUrl;
     entry.loading = false;
     setImageCache(fileId, imageUrl);
@@ -459,6 +524,19 @@ async function loadMore() {
   }
 }
 
+function maybeLoadMoreForDetail(index = selectedIndex.value) {
+  if (!Number.isFinite(index) || index < 0) return;
+  const remaining = entries.value.length - 1 - index;
+  if (remaining <= DETAIL_AUTO_LOAD_THRESHOLD) {
+    void loadMore();
+  }
+}
+
+function requestMoreForPhotoSwipe(index) {
+  const targetIndex = Number.isFinite(index) ? index : selectedIndex.value;
+  maybeLoadMoreForDetail(targetIndex);
+}
+
 function setupLoadMoreObserver() {
   if (typeof window === 'undefined' || !('IntersectionObserver' in window)) return;
   if (!loadMoreAnchor.value) return;
@@ -488,11 +566,11 @@ async function refreshSingleImage(entry) {
 
   entry.loading = true;
   try {
-    const imageUrl = `/api/fileurl?file_id=${encodeURIComponent(entry.telegram.file_id)}&t=${Date.now()}`;
+    const imageUrl = buildFileUrl(entry.telegram.file_id, true);
     entry.src = imageUrl;
     entry.loading = false;
 
-    setImageCache(entry.telegram.file_id, imageUrl);
+    setImageCache(entry.telegram.file_id, buildFileUrl(entry.telegram.file_id, false));
   } catch (err) {
     console.error('Failed to refresh image:', err);
     entry.loading = false;
@@ -531,11 +609,23 @@ async function clearImageCache() {
 
 function open(entry) {
   const index = entries.value.findIndex(e => e.id === entry.id);
+  if (index < 0) return;
+  if (selectedIndex.value < 0 && typeof window !== 'undefined') {
+    window.history.pushState({ __galleryDetail: true }, '');
+    hasDetailHistoryState = true;
+  }
   selectedIndex.value = index;
+  maybeLoadMoreForDetail(index);
 }
 
 function close() {
+  if (selectedIndex.value < 0) return;
   selectedIndex.value = -1;
+  if (hasDetailHistoryState && typeof window !== 'undefined') {
+    suppressNextPopstate = true;
+    hasDetailHistoryState = false;
+    window.history.back();
+  }
 }
 
 function prevImage() {
@@ -547,8 +637,21 @@ function prevImage() {
 function nextImage() {
   if (selectedIndex.value < entries.value.length - 1) {
     selectedIndex.value++;
+    maybeLoadMoreForDetail(selectedIndex.value);
   }
 }
+
+function setSelectedImageIndex(index) {
+  if (!Number.isFinite(index)) return;
+  const clamped = Math.max(0, Math.min(Number(index), entries.value.length - 1));
+  if (clamped === selectedIndex.value) return;
+  selectedIndex.value = clamped;
+  maybeLoadMoreForDetail(clamped);
+}
+
+watch(selectedIndex, (index) => {
+  maybeLoadMoreForDetail(index);
+});
 
 function logout() {
   localStorage.removeItem('gallery_token');
@@ -677,10 +780,53 @@ function updateColumnCount() {
   else columnCount.value = 5;
 }
 
+function ensureHistoryGuard() {
+  if (typeof window === 'undefined') return;
+
+  const currentState = (window.history.state && typeof window.history.state === 'object')
+    ? window.history.state
+    : {};
+
+  if (!currentState.__galleryRoot) {
+    window.history.replaceState({ ...currentState, __galleryRoot: true }, '');
+  }
+  window.history.pushState({ __galleryGuard: true }, '');
+}
+
+function handleRootBackPress() {
+  const now = Date.now();
+  if (now - lastRootBackAt <= ROOT_BACK_EXIT_WINDOW_MS) {
+    window.removeEventListener('popstate', handlePopState);
+    window.history.back();
+    return;
+  }
+
+  lastRootBackAt = now;
+  showToastMsg('再按一次返回退出网页', ROOT_BACK_EXIT_WINDOW_MS);
+  window.history.pushState({ __galleryGuard: true }, '');
+}
+
+function handlePopState() {
+  if (suppressNextPopstate) {
+    suppressNextPopstate = false;
+    return;
+  }
+
+  if (selectedIndex.value >= 0) {
+    selectedIndex.value = -1;
+    hasDetailHistoryState = false;
+    return;
+  }
+
+  handleRootBackPress();
+}
+
 onMounted(() => {
+  ensureHistoryGuard();
   load();
   updateColumnCount();
   window.addEventListener('resize', updateColumnCount);
+  window.addEventListener('popstate', handlePopState);
   nextTick(() => {
     setupLoadMoreObserver();
   });
@@ -692,6 +838,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('resize', updateColumnCount);
+  window.removeEventListener('popstate', handlePopState);
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -918,7 +1065,9 @@ onUnmounted(() => {
       :onClose="close"
       :onPrev="prevImage"
       :onNext="nextImage"
+      :onSetIndex="setSelectedImageIndex"
       :onRefresh="() => refreshSingleImage(entries[selectedIndex])"
+      :onNeedMore="requestMoreForPhotoSwipe"
     />
   </div>
 </template>

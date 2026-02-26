@@ -9,11 +9,15 @@ const props = defineProps({
   onClose: Function,
   onPrev: Function,
   onNext: Function,
-  onRefresh: Function
+  onSetIndex: Function,
+  onRefresh: Function,
+  onNeedMore: Function
 });
 
 const copySuccess = ref('');
 let lightbox = null;
+let lightboxDataSource = [];
+const PHOTOSWIPE_AUTO_LOAD_THRESHOLD = 5;
 
 const currentEntry = computed(() => props.entries[props.currentIndex]);
 
@@ -57,19 +61,52 @@ function copyAllInfo() {
   copyToClipboard(allInfo.join('\n'), '全部信息');
 }
 
+function toPhotoSwipeItem(entry) {
+  const fallbackSrc = entry?.telegram?.file_id
+    ? `/api/fileurl?file_id=${encodeURIComponent(entry.telegram.file_id)}`
+    : '';
+  return {
+    src: entry?.src || fallbackSrc,
+    width: entry?.metadata?.width || 1200,
+    height: entry?.metadata?.height || 1600,
+    alt: entry?.prompt || ''
+  };
+}
+
+function maybeRequestMore(currentIndex = props.currentIndex) {
+  if (typeof props.onNeedMore !== 'function') return;
+  if (!Number.isFinite(currentIndex) || currentIndex < 0) return;
+
+  const remaining = props.entries.length - 1 - currentIndex;
+  if (remaining <= PHOTOSWIPE_AUTO_LOAD_THRESHOLD) {
+    props.onNeedMore(currentIndex);
+  }
+}
+
+function syncPhotoSwipeDataSource() {
+  if (!lightbox || !Array.isArray(lightboxDataSource)) return;
+  const targetLen = props.entries.length;
+  const currentLen = lightboxDataSource.length;
+  if (targetLen <= currentLen) return;
+
+  for (let i = currentLen; i < targetLen; i++) {
+    lightboxDataSource.push(toPhotoSwipeItem(props.entries[i]));
+  }
+
+  if (lightbox.pswp) {
+    lightbox.pswp.options.dataSource = lightboxDataSource;
+  }
+}
+
 function openPhotoSwipe() {
   if (lightbox) {
     lightbox.destroy();
     lightbox = null;
   }
+  lightboxDataSource = props.entries.map((entry) => toPhotoSwipeItem(entry));
 
   lightbox = new PhotoSwipeLightbox({
-    dataSource: props.entries.map((entry, idx) => ({
-      src: entry.src,
-      width: entry.metadata?.width || 1200,
-      height: entry.metadata?.height || 1600,
-      alt: entry.prompt
-    })),
+    dataSource: lightboxDataSource,
     pswpModule: () => import('photoswipe'),
     index: props.currentIndex,
     bgOpacity: 0.95,
@@ -80,12 +117,15 @@ function openPhotoSwipe() {
   lightbox.on('change', () => {
     const newIndex = lightbox.pswp.currIndex;
     if (newIndex !== props.currentIndex) {
-      if (newIndex > props.currentIndex) {
+      if (typeof props.onSetIndex === 'function') {
+        props.onSetIndex(newIndex);
+      } else if (newIndex > props.currentIndex) {
         props.onNext();
       } else {
         props.onPrev();
       }
     }
+    maybeRequestMore(newIndex);
   });
 
   lightbox.on('close', () => {
@@ -93,10 +133,12 @@ function openPhotoSwipe() {
       lightbox.destroy();
       lightbox = null;
     }
+    lightboxDataSource = [];
   });
 
   lightbox.init();
   lightbox.loadAndOpen(props.currentIndex);
+  maybeRequestMore(props.currentIndex);
 }
 
 function handleKeydown(e) {
@@ -111,6 +153,17 @@ function handleKeydown(e) {
   }
 }
 
+watch(
+  () => props.entries.length,
+  (newLen, oldLen) => {
+    if (newLen === oldLen) return;
+    syncPhotoSwipeDataSource();
+    if (lightbox?.pswp) {
+      maybeRequestMore(lightbox.pswp.currIndex);
+    }
+  }
+);
+
 onMounted(() => {
   document.body.style.overflow = 'hidden';
   document.addEventListener('keydown', handleKeydown);
@@ -121,6 +174,7 @@ onUnmounted(() => {
     lightbox.destroy();
     lightbox = null;
   }
+  lightboxDataSource = [];
   document.body.style.overflow = '';
   document.removeEventListener('keydown', handleKeydown);
 });
